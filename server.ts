@@ -5,11 +5,18 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
 
 const PORT = parseInt(process.env.PORT || "3000");
+const MEM0_API_KEY = process.env.MEM0_API_KEY || "";
+const MEM0_USER_ID = process.env.MEM0_USER_ID || "mem0-mcp";
 const app = express();
 
 // Health endpoint
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", service: "gemini-live-bridge" });
+  res.json({
+    status: "ok",
+    service: "gemini-live-bridge",
+    mem0: MEM0_API_KEY ? "configured" : "disabled",
+    supabase: supabaseKey ? "configured" : "disabled",
+  });
 });
 
 // CORS for the dashboard
@@ -108,6 +115,90 @@ function startEyesRelay() {
 // Start Eyes relay when the Server spins up
 startEyesRelay();
 
+// --- Mem0 Context Injection ---
+// Pulls relevant memories from Mem0 to inject into Gemini's system prompt
+// so the agent "remembers" the user across sessions.
+async function fetchMem0Context(missionName?: string): Promise<string> {
+  if (!MEM0_API_KEY) {
+    console.log("[Mem0] No MEM0_API_KEY — skipping context injection.");
+    return "";
+  }
+
+  const memories: string[] = [];
+
+  try {
+    // 1. Generic identity memories (who is the user, what do they do)
+    const identityRes = await fetch("https://api.mem0.ai/v1/memories/search/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Token ${MEM0_API_KEY}`,
+      },
+      body: JSON.stringify({
+        query: "Who is Alan and what does Coolbrick Property Management do",
+        user_id: MEM0_USER_ID,
+        limit: 3,
+      }),
+    });
+
+    if (identityRes.ok) {
+      const identityData = await identityRes.json();
+      const identityMemories = (identityData.results || identityData || [])
+        .map((m: any) => m.memory)
+        .filter(Boolean);
+      memories.push(...identityMemories);
+      console.log(`[Mem0] Retrieved ${identityMemories.length} identity memories.`);
+    } else {
+      console.error(`[Mem0] Identity search failed: ${identityRes.status} ${identityRes.statusText}`);
+    }
+
+    // 2. Mission-specific memories (if a mission is active)
+    if (missionName) {
+      const missionRes = await fetch("https://api.mem0.ai/v1/memories/search/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Token ${MEM0_API_KEY}`,
+        },
+        body: JSON.stringify({
+          query: missionName,
+          user_id: MEM0_USER_ID,
+          limit: 2,
+        }),
+      });
+
+      if (missionRes.ok) {
+        const missionData = await missionRes.json();
+        const missionMemories = (missionData.results || missionData || [])
+          .map((m: any) => m.memory)
+          .filter(Boolean);
+        // Deduplicate against identity memories
+        const newMemories = missionMemories.filter(
+          (m: string) => !memories.includes(m)
+        );
+        memories.push(...newMemories);
+        console.log(`[Mem0] Retrieved ${newMemories.length} mission-specific memories for "${missionName}".`);
+      } else {
+        console.error(`[Mem0] Mission search failed: ${missionRes.status}`);
+      }
+    }
+  } catch (err) {
+    console.error("[Mem0] Context injection failed (non-fatal):", err);
+    return "";
+  }
+
+  if (memories.length === 0) return "";
+
+  const contextBlock = [
+    "\n\n--- MEMORY CONTEXT (from previous sessions) ---",
+    ...memories.map((m, i) => `${i + 1}. ${m}`),
+    "--- END MEMORY CONTEXT ---\n",
+  ].join("\n");
+
+  console.log(`[Mem0] Injecting ${memories.length} memories into system prompt.`);
+  return contextBlock;
+}
+
 wss.on("connection", (ws) => {
   console.log("Client connected to Standalone Bridge");
   let geminiSession: any = null;
@@ -126,13 +217,23 @@ wss.on("connection", (ws) => {
 
         const ai = new GoogleGenAI({ apiKey });
         console.log("Setting up Gemini Live Session...");
+
+        // Fetch Mem0 context to inject into system prompt
+        const missionContext = activeMission?.name || undefined;
+        const mem0Context = await fetchMem0Context(missionContext);
+        const baseInstruction = message.systemInstruction || "You are a helpful assistant.";
+        const enrichedInstruction = mem0Context
+          ? `${baseInstruction}${mem0Context}`
+          : baseInstruction;
+
+        console.log(`[Setup] System instruction length: ${enrichedInstruction.length} chars (base: ${baseInstruction.length}, mem0: ${mem0Context.length})`);
         
         try {
           geminiSession = await ai.live.connect({
             model: "gemini-3.1-flash-live-preview",
             config: {
               responseModalities: [Modality.AUDIO],
-              systemInstruction: message.systemInstruction || "You are a helpful assistant.",
+              systemInstruction: enrichedInstruction,
               outputAudioTranscription: {},
               inputAudioTranscription: {},
               speechConfig: {
