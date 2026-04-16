@@ -322,3 +322,4 @@ wss.on("connection", (ws) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Gemini Live Bridge running on port ${PORT}`);
 });
+// Mem0 context injection - rebuild trigger 1776347072
